@@ -3366,11 +3366,29 @@ void RenderGraph::Apply() {
             if (!geoPass || !geoPass->enabled || !geoPass->shaderDefinition) continue;
             if (geoPass->condition && !geoPass->condition()) continue;
 
-            Framebuffer* fb = FindFramebuffer(geoPass->targetFramebufferName);
-            if (!fb || fb->id == 0) continue;
+            // An empty targetFramebufferName means "draw straight to the
+            // window's default framebuffer" -- the same target
+            // BeginMode3D/EndMode3D would hit with no render graph
+            // involved at all. Only resolve a Framebuffer when one was
+            // actually requested; fb stays null for the default-target
+            // case and every fb-> access below is guarded accordingly.
+            const bool usesDefaultFramebuffer = geoPass->targetFramebufferName.empty();
+            Framebuffer* fb = usesDefaultFramebuffer ? nullptr : FindFramebuffer(geoPass->targetFramebufferName);
+            if (!usesDefaultFramebuffer && (!fb || fb->id == 0)) continue;
+
+            const int fbWidth = fb ? fb->width : width_;
+            const int fbHeight = fb ? fb->height : height_;
+
             auto queryScope = createQueryScope(node.name);
-            rlEnableFramebuffer(fb->id);
-            rlActiveDrawBuffers(static_cast<int>(fb->colorAttachments.size()));
+            if (fb) {
+                rlEnableFramebuffer(fb->id);
+                rlActiveDrawBuffers(static_cast<int>(fb->colorAttachments.size()));
+            } else {
+                // No FBO to enable and no extra color attachments to
+                // activate -- just make sure the default framebuffer
+                // (the window) is the active draw target.
+                rlDisableFramebuffer();
+            }
 
             ApplyPassRenderState(geoPass->renderState);
 
@@ -3466,7 +3484,7 @@ void RenderGraph::Apply() {
                 }
             };
 
-            if (geoPass->isCubemapCapture && geoPass->cubemapCamera && fb->isCubemap) {
+            if (fb && geoPass->isCubemapCapture && geoPass->cubemapCamera && fb->isCubemap) {
                 // Standard OpenGL cubemap face convention -- target
                 // direction and up vector per face, ordered +X/-X/+Y/-Y/
                 // +Z/-Z to match RL_ATTACHMENT_CUBEMAP_POSITIVE_X + face
@@ -3513,7 +3531,7 @@ void RenderGraph::Apply() {
                     if (geoPass->drawCallback) geoPass->drawCallback();
                     executeGeometryDrawItems();
                 }
-            } else if (fb->isTextureArray) {
+            } else if (fb && fb->isTextureArray) {
                 // No forced camera/projection here, unlike the cubemap
                 // branch above -- a texture-array slice is just "the
                 // N'th independent image," so there's no shared math to
@@ -3565,7 +3583,7 @@ void RenderGraph::Apply() {
             }
 
             if (geoHasScissor) rlDisableScissorTest();
-            if (geoHasViewport || geoPass->isCubemapCapture || fb->isTextureArray) rlViewport(0, 0, fb->width, fb->height);
+            if (geoHasViewport || geoPass->isCubemapCapture || (fb && fb->isTextureArray)) rlViewport(0, 0, fbWidth, fbHeight);
 
             rlDisableShader();
             currentShaderId_ = 0;
@@ -5671,8 +5689,11 @@ bool RenderGraph::ValidateGraph() const {
             const GeometryPass* pass = FindGeometryPass(node.name);
             if (!pass) { valid = false; continue; }
 
-            // Ensure the target framebuffer exists
-            if (!FindFramebuffer(pass->targetFramebufferName)) {
+            // Ensure the target framebuffer exists -- an empty name is
+            // fine and means "draw to the default framebuffer" (see
+            // Apply()); only a name that was set but doesn't resolve is
+            // an actual error.
+            if (!pass->targetFramebufferName.empty() && !FindFramebuffer(pass->targetFramebufferName)) {
                 TraceLog(LOG_WARNING, "RenderGraph: geometry pass '%s' targets non-existent framebuffer '%s'",
                          pass->name.c_str(), pass->targetFramebufferName.c_str());
                 valid = false;
@@ -5737,7 +5758,10 @@ std::vector<ValidationIssue> RenderGraph::Validate() const {
             addIssue("GeometryPass", pass.name, "shader", pass.shaderName,
                      "Geometry pass '" + pass.name + "' references shader '" + pass.shaderName + "' which failed to resolve");
         }
-        if (pass.targetFramebufferName.empty() || !FindFramebuffer(pass.targetFramebufferName)) {
+        // Empty targetFramebufferName is valid -- it means the pass draws
+        // straight to the window's default framebuffer (see Apply()) --
+        // so only flag a name that was actually set but doesn't resolve.
+        if (!pass.targetFramebufferName.empty() && !FindFramebuffer(pass.targetFramebufferName)) {
             addIssue("GeometryPass", pass.name, "target framebuffer", pass.targetFramebufferName,
                      "Geometry pass '" + pass.name + "' targets framebuffer '" + pass.targetFramebufferName + "' which does not exist");
         }
